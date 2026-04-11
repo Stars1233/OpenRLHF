@@ -22,6 +22,7 @@ from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 from openrlhf.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
+from openrlhf.utils.vlm_utils import merge_mm_train_inputs
 
 from ..ppo_utils import NaiveReplayBuffer
 
@@ -220,6 +221,7 @@ class ActorPPOTrainer(ABC):
                     "tot_len": merged_status.get("total_length", 0),
                     "kl": merged_status.get("kl", 0),
                     "act_lr": actor_lr,
+                    "grad_norm": merged_status.get("actor_grad_norm", 0),
                 }
                 if "entropy_loss" in merged_status:
                     short_status["ent_loss"] = merged_status["entropy_loss"]
@@ -254,6 +256,15 @@ class ActorPPOTrainer(ABC):
         advantages = experience.advantages
         base_action_log_probs = experience.base_action_log_probs
 
+        # VLM: merge pre-processed multimodal inputs for training forward
+        mm_inputs = {}
+        if (
+            hasattr(experience, "mm_train_inputs")
+            and experience.mm_train_inputs
+            and getattr(self.actor, "is_vlm", False)
+        ):
+            mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, sequences.device)
+
         # actor loss
         action_log_probs, output = self.actor(
             sequences,
@@ -263,6 +274,7 @@ class ActorPPOTrainer(ABC):
             ring_attn_group=self.strategy.ring_attn_group,
             packed_seq_lens=packed_seq_lens,
             return_entropy=self.args.entropy_loss_coef is not None,
+            **mm_inputs,
         )
 
         # loss function
@@ -373,7 +385,7 @@ class ActorPPOTrainer(ABC):
 
         torch.cuda.empty_cache()
         model = self.actor.model.module
-        count, num_params = 0, len(list(model.named_parameters()))
+        count = 0
 
         def _broadcast_param(param, count, num_params):
             use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
@@ -430,7 +442,13 @@ class ActorPPOTrainer(ABC):
 
         sync_fn = _handle_cuda_ipc if self.use_cuda_ipc else _broadcast_param
 
-        for name, param in model.named_parameters():
+        # VLM: only sync trainable (language model) params — vision encoder is frozen.
+        params_to_sync = [
+            (n, p) for n, p in model.named_parameters() if p.requires_grad or not getattr(self.actor, "is_vlm", False)
+        ]
+        num_params = len(params_to_sync)
+
+        for name, param in params_to_sync:
             count += 1  # empty_cache at last param
             with _gather_params_ctx(param):
                 sync_fn(param, count, num_params)
@@ -474,6 +492,7 @@ class PolicyModelActor(BaseModelActor):
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
             use_liger_kernel=strategy.args.use_liger_kernel,
+            freeze_visual_encoder=getattr(strategy.args, "freeze_visual_encoder", False),
         )
         strategy.print(actor)
 
@@ -576,9 +595,16 @@ class PolicyModelActor(BaseModelActor):
         action_mask: Optional[Union[int, list[int]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         packed_seq_lens=None,
+        mm_train_inputs_list=None,
     ) -> torch.Tensor:
         """Generates actor values."""
         device = torch.cuda.current_device()
+
+        # VLM: merge pre-processed multimodal inputs from all samples in batch
+        mm_inputs = {}
+        if mm_train_inputs_list and getattr(self.actor, "is_vlm", False):
+            mm_inputs = merge_mm_train_inputs(mm_train_inputs_list, device)
+
         self.actor.eval()
         with torch.no_grad():
             action_log_probs = self.actor(
@@ -586,6 +612,7 @@ class PolicyModelActor(BaseModelActor):
                 action_mask.to(device),
                 attention_mask.to(device),
                 ring_attn_group=self.strategy.ring_attn_group,
+                **mm_inputs,
             )
         self.actor.train()  # reset model state
         return action_log_probs.to("cpu")

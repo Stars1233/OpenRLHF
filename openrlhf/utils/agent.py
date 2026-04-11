@@ -11,7 +11,7 @@ logger = init_logger(__name__)
 
 class AgentExecutorBase(ABC):
     @abstractmethod
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
+    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, images=None):
         raise NotImplementedError("AgentExecutorBase.execute is not implemented")
 
 
@@ -33,7 +33,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         assert issubclass(agent_instance_cls, AgentInstanceBase), "AgentInstance must inherit from AgentInstanceBase"
         self.agent_instance_cls = agent_instance_cls
 
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
+    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, images=None):
         # Treat each AgentInstance as an isolated environment; bind every prompt to its own independent instance
         agent_instance = self.agent_instance_cls()
 
@@ -160,9 +160,18 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
             spec.loader.exec_module(reward_module)
             self.reward_func = reward_module.reward_func
 
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
-        # Tokenize the initial observation.
-        prompt_token_ids = hf_tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
+    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, images=None):
+        # Tokenize — for VLM the processor inserts image tokens and returns pixel tensors.
+        pil_images = []
+        mm_train_inputs = None
+        if images and hasattr(hf_tokenizer, "image_processor"):
+            from openrlhf.utils.vlm_utils import process_prompt_with_images
+
+            prompt_token_ids, mm_train_inputs, pil_images = process_prompt_with_images(hf_tokenizer, prompt, images)
+        else:
+            prompt_token_ids = hf_tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][
+                0
+            ].tolist()
 
         # Compute dynamic max_tokens when not explicitly set (prompt + response share max_length budget)
         effective_params = sampling_params
@@ -173,14 +182,25 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
         # Truncate prompt if it's too long to leave room for generation
         max_prompt_length = max_length - effective_params.max_tokens
         if len(prompt_token_ids) > max_prompt_length:
+            if pil_images:
+                raise ValueError(
+                    f"VLM prompt length ({len(prompt_token_ids)}) exceeds max_prompt_length ({max_prompt_length}). "
+                    f"Truncating VLM prompts would break image token alignment with pixel_values. "
+                    f"Please increase --max_len or decrease --max_new_tokens."
+                )
             logger.warning(
                 f"Prompt length ({len(prompt_token_ids)}) exceeds max_prompt_length ({max_prompt_length}). "
                 f"Truncating to fit within max_length ({max_length}) with max_tokens ({effective_params.max_tokens})."
             )
             prompt_token_ids = prompt_token_ids[-max_prompt_length:]
 
+        # Reuse already-loaded PIL images for vLLM generation.
+        mm_data = {"image": pil_images} if pil_images else None
+
         # Generate one continuation from the engine.
-        request_output = await llm_engine.generate(prompt_token_ids, deepcopy(effective_params))
+        request_output = await llm_engine.generate(
+            prompt_token_ids, deepcopy(effective_params), multi_modal_data=mm_data
+        )
         generation_output = request_output.outputs[0]
         action_token_ids = generation_output.token_ids
 
@@ -201,9 +221,11 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
 
         # Store the final response.
         output = {
-            # Original prompt/label are echoed for convenience.
+            # Original prompt/label/images are echoed for convenience.
             "prompt": prompt,
             "label": label,
+            "images": images,
+            "mm_train_inputs": mm_train_inputs,
             # Token/text observations and action span.
             "observation_tokens": observation_token_ids,
             "action_ranges": action_ranges,
