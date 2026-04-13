@@ -42,15 +42,31 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         reset_result = await agent_instance.reset(initial_states)
         observation_text = reset_result["observation"]
 
-        # Tokenize the initial observation
-        current_obs_tokens = hf_tokenizer(observation_text, add_special_tokens=False, return_tensors="pt")[
-            "input_ids"
-        ][0].tolist()
+        # Tokenize the initial observation — for VLM the processor inserts
+        # image placeholder tokens and returns pixel tensors for training.
+        pil_images = []
+        mm_train_inputs = None
+        if images and hasattr(hf_tokenizer, "image_processor"):
+            from openrlhf.utils.vlm_utils import process_prompt_with_images
+
+            current_obs_tokens, mm_train_inputs, pil_images = process_prompt_with_images(
+                hf_tokenizer, observation_text, images
+            )
+        else:
+            current_obs_tokens = hf_tokenizer(text=observation_text, add_special_tokens=False, return_tensors="pt")[
+                "input_ids"
+            ][0].tolist()
 
         # Truncate initial observation if it's too long to leave room for generation
         min_generation_tokens = sampling_params.max_tokens if hasattr(sampling_params, "max_tokens") else 1
         max_initial_length = max_length - min_generation_tokens
         if len(current_obs_tokens) > max_initial_length:
+            if pil_images:
+                raise ValueError(
+                    f"VLM prompt length ({len(current_obs_tokens)}) exceeds max_initial_length ({max_initial_length}). "
+                    f"Truncating VLM prompts would break image token alignment with pixel_values. "
+                    f"Please increase --max_len or decrease --max_new_tokens."
+                )
             logger.warning(
                 f"Initial observation length ({len(current_obs_tokens)}) exceeds max_initial_length ({max_initial_length}). "
                 f"Truncating to fit within max_length ({max_length})."
@@ -79,7 +95,10 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
                 break
 
             # Generate response asynchronously (input and output are token ids)
-            request_output = await llm_engine.generate(current_obs_tokens, deepcopy(sampling_params))
+            mm_data = {"image": pil_images} if pil_images else None
+            request_output = await llm_engine.generate(
+                current_obs_tokens, deepcopy(sampling_params), multi_modal_data=mm_data
+            )
             action_tokens = request_output.outputs[0].token_ids
             action_text = request_output.outputs[0].text
 
@@ -100,18 +119,38 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             total_reward += step_result["rewards"].item()
             final_scores = step_result.get("scores", total_reward)
             environment_feedback_text = step_result["environment_feedback"]
+            environment_images = step_result.get("environment_images")
             done = step_result["done"]
             extra_logs = step_result.get("extra_logs", {})
 
-            # Concatenate observation, action, and environment_feedback, then tokenize
+            # Tokenize environment feedback — may contain new images (e.g. screenshots).
+            if environment_images and hasattr(hf_tokenizer, "image_processor"):
+                from openrlhf.utils.vlm_utils import accumulate_mm_inputs, process_prompt_with_images
+
+                feedback_tokens, new_mm, new_pil = process_prompt_with_images(
+                    hf_tokenizer, environment_feedback_text, environment_images
+                )
+                # Only accumulate images if the feedback fits within max_length.
+                # If feedback would be truncated downstream, image placeholder
+                # tokens could be removed while pixel_values remain — crashing
+                # the VLM forward pass due to count mismatch.  These feedback
+                # tokens have action_mask=0 and don't affect training anyway.
+                total_after = len(current_obs_tokens) + len(action_tokens) + len(feedback_tokens)
+                if total_after > max_length and new_mm is not None:
+                    feedback_tokens = hf_tokenizer(
+                        text=environment_feedback_text, add_special_tokens=False, return_tensors="pt"
+                    )["input_ids"][0].tolist()
+                else:
+                    pil_images.extend(new_pil)
+                    mm_train_inputs = accumulate_mm_inputs(mm_train_inputs, new_mm)
+            else:
+                feedback_tokens = hf_tokenizer(
+                    text=environment_feedback_text, add_special_tokens=False, return_tensors="pt"
+                )["input_ids"][0].tolist()
+
+            # Concatenate observation, action, and environment_feedback
             observation_text = observation_text + action_text + environment_feedback_text
-            current_obs_tokens = (
-                current_obs_tokens
-                + action_tokens
-                + hf_tokenizer(environment_feedback_text, add_special_tokens=False, return_tensors="pt")["input_ids"][
-                    0
-                ].tolist()
-            )
+            current_obs_tokens = current_obs_tokens + action_tokens + feedback_tokens
 
             # Calculate rollout log probs
             if sampling_params.logprobs is not None:
@@ -119,7 +158,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
                 for i, logprob in enumerate(request_output.outputs[0].logprobs):
                     rollout_log_probs.append(logprob[action_tokens[i]].logprob)
                 # dummy logprobs for the env feedback tokens
-                rollout_log_probs.extend([0.0] * (len(current_obs_tokens) - len(rollout_log_probs)))
+                rollout_log_probs.extend([0.0] * len(feedback_tokens))
 
             # Get sampling params from the environment step
             if step_result.get("sampling_params", None):
@@ -132,6 +171,8 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         final_response = {
             "prompt": prompt,
             "label": label,
+            "images": images,
+            "mm_train_inputs": mm_train_inputs,
             "reward": total_reward,
             "scores": final_scores,
             "observation_tokens": current_obs_tokens,
@@ -169,7 +210,7 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
 
             prompt_token_ids, mm_train_inputs, pil_images = process_prompt_with_images(hf_tokenizer, prompt, images)
         else:
-            prompt_token_ids = hf_tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][
+            prompt_token_ids = hf_tokenizer(text=prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][
                 0
             ].tolist()
 

@@ -14,8 +14,20 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _is_base64_image(s: str) -> bool:
+    """Heuristic check for base64-encoded image data."""
+    if s.startswith("data:image"):
+        return True
+    # Bare base64: must be reasonably long and contain only valid chars.
+    if len(s) > 256:
+        import re
+
+        return bool(re.fullmatch(r"[A-Za-z0-9+/\n\r]+=*", s[:512]))
+    return False
+
+
 def load_images(image_refs: Union[str, List[str], Image.Image, List[Any]]) -> List[Image.Image]:
-    """Load PIL images from paths, URLs, or pass-through PIL objects.
+    """Load PIL images from paths, URLs, base64 strings, raw bytes, or PIL objects.
 
     Invalid entries (missing files, broken URLs, unsupported types) are
     skipped with a warning instead of crashing the training run.
@@ -30,11 +42,19 @@ def load_images(image_refs: Union[str, List[str], Image.Image, List[Any]]) -> Li
         try:
             if isinstance(img, Image.Image):
                 pil_images.append(img)
+            elif isinstance(img, bytes):
+                pil_images.append(Image.open(io.BytesIO(img)))
             elif isinstance(img, str):
                 if img.startswith(("http://", "https://")):
                     import requests
 
                     pil_images.append(Image.open(io.BytesIO(requests.get(img, timeout=30).content)))
+                elif _is_base64_image(img):
+                    import base64
+
+                    # Strip optional data-URI header: "data:image/png;base64,..."
+                    raw = img.split(",", 1)[-1] if img.startswith("data:") else img
+                    pil_images.append(Image.open(io.BytesIO(base64.b64decode(raw))))
                 else:
                     pil_images.append(Image.open(img))
             else:
@@ -82,7 +102,7 @@ def process_prompt_with_images(
             "Image placeholder tokens in the prompt may not match pixel_values."
         )
 
-    proc_out = processor(text=[prompt], images=pil_images, return_tensors="pt")
+    proc_out = processor(text=[prompt], images=pil_images, add_special_tokens=False, return_tensors="pt")
     token_ids = proc_out["input_ids"][0].tolist()
 
     # Keep only multimodal tensors (pixel_values, image_grid_thw, ...).
@@ -94,6 +114,27 @@ def process_prompt_with_images(
     mm_train_inputs = {k: v for k, v in proc_out.items() if k not in _skip_keys}
 
     return token_ids, (mm_train_inputs or None), pil_images
+
+
+def accumulate_mm_inputs(existing: Optional[Dict], new: Optional[Dict]) -> Optional[Dict]:
+    """Incrementally merge a new step's multimodal tensors into the running accumulator.
+
+    Handles key asymmetry: keys present in only one dict are preserved as-is,
+    keys present in both are concatenated along dim=0.
+    """
+    if new is None:
+        return existing
+    if existing is None:
+        return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in new.items()}
+    merged = {}
+    for k in set(existing) | set(new):
+        if k in existing and k in new:
+            merged[k] = torch.cat([existing[k], new[k]], dim=0)
+        elif k in existing:
+            merged[k] = existing[k]
+        else:
+            merged[k] = new[k]
+    return merged
 
 
 def merge_mm_train_inputs(mm_train_inputs_list: list, device) -> Dict[str, torch.Tensor]:
