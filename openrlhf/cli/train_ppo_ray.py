@@ -179,7 +179,7 @@ def train(args):
     if critic_model is not None and args.critic_pretrain:
         # critic scheduler initialization depends on max_step, so we have to init critic after actor
         # TODO: use first reward model as critic model
-        refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
+        refs = critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps)
         ray.get(refs)
 
     # train actor and critic model
@@ -375,7 +375,7 @@ if __name__ == "__main__":
         default=None,
         help="Max tokens to generate per sample. If None, dynamically computed as max_len - prompt_len per sample.",
     )
-    parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
+    parser.add_argument("--max_samples", type=int, default=int(1e8), help="Max number of samples")
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
@@ -573,7 +573,7 @@ if __name__ == "__main__":
         args.remote_rm_url = args.remote_rm_url.split(",")
 
     if args.input_template and "{}" not in args.input_template:
-        print("[Warning] {} not in args.input_template, set to None")
+        print("[Warning] '{}' not in args.input_template, set to None")
         args.input_template = None
 
     if args.input_template and "\\n" in args.input_template:

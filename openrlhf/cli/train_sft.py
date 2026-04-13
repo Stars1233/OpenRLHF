@@ -159,7 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_sft")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
-    parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
+    parser.add_argument("--max_ckpt_mem", type=int, default=int(1e8))
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
     parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
 
@@ -275,7 +275,7 @@ if __name__ == "__main__":
         assert args.apply_chat_template, "apply_chat_template must be enabled when using multiturn format"
 
     if args.input_template and "{}" not in args.input_template:
-        print("[Warning] {} not in args.input_template, set to None")
+        print("[Warning] '{}' not in args.input_template, set to None")
         args.input_template = None
 
     if args.input_template and "\\n" in args.input_template:
