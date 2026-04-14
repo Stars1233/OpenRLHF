@@ -289,9 +289,12 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
                     rewards_info_list = await self._fetch_rewards_via_http([query], [prompt], [label])
                 rewards_info = rewards_info_list[0] if rewards_info_list else None
                 if rewards_info:
+                    score_value = rewards_info.get("scores")
+                    if score_value is None:
+                        score_value = rewards_info.get("rewards")
                     output.update(
                         reward=rewards_info.get("rewards"),
-                        scores=rewards_info.get("scores") or rewards_info.get("rewards"),
+                        scores=score_value,
                         extra_logs=rewards_info.get("extra_logs") or {},
                     )
             except Exception as e:
