@@ -130,19 +130,17 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
                 feedback_tokens, new_mm, new_pil = process_prompt_with_images(
                     hf_tokenizer, environment_feedback_text, environment_images
                 )
-                # Only accumulate images if the feedback fits within max_length.
-                # If feedback would be truncated downstream, image placeholder
-                # tokens could be removed while pixel_values remain — crashing
-                # the VLM forward pass due to count mismatch.  These feedback
-                # tokens have action_mask=0 and don't affect training anyway.
                 total_after = len(current_obs_tokens) + len(action_tokens) + len(feedback_tokens)
-                if total_after > max_length and new_mm is not None:
-                    feedback_tokens = hf_tokenizer(
-                        text=environment_feedback_text, add_special_tokens=False, return_tensors="pt"
-                    )["input_ids"][0].tolist()
-                else:
+                if total_after <= max_length or new_mm is None:
                     pil_images.extend(new_pil)
                     mm_train_inputs = accumulate_mm_inputs(mm_train_inputs, new_mm)
+                else:
+                    # Overflow — drop images and strip their pad tokens so
+                    # vLLM doesn't treat them as image placeholders.
+                    mm_pad_ids = {getattr(hf_tokenizer, a, None) for a in ("image_token_id", "video_token_id")} - {
+                        None
+                    }
+                    feedback_tokens = [t for t in feedback_tokens if t not in mm_pad_ids]
             else:
                 feedback_tokens = hf_tokenizer(
                     text=environment_feedback_text, add_special_tokens=False, return_tensors="pt"
