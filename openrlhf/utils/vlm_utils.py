@@ -8,6 +8,7 @@ import io
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -114,6 +115,19 @@ def process_prompt_with_images(
     mm_train_inputs = {k: v for k, v in proc_out.items() if k not in _skip_keys}
 
     return token_ids, (mm_train_inputs or None), pil_images
+
+
+def dedup_media_tokens(token_ids: List[int], pad_token_ids: set) -> List[int]:
+    """Collapse consecutive image/video pad tokens to a single placeholder.
+
+    vLLM expects one placeholder per image and expands it internally.
+    Passing already-expanded token IDs causes double-expansion.
+    """
+    ids = np.asarray(token_ids)
+    is_pad = np.isin(ids, list(pad_token_ids))
+    keep = np.ones(len(ids), dtype=bool)
+    keep[1:] &= ~(is_pad[1:] & is_pad[:-1])
+    return ids[keep].tolist()
 
 
 def accumulate_mm_inputs(existing: Optional[Dict], new: Optional[Dict]) -> Optional[Dict]:

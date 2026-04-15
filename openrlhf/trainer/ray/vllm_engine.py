@@ -40,6 +40,7 @@ class LLMRayActor:
         bundle_indices: list = None,
         agent_func_path: Optional[str] = None,
         remote_rm_url: Optional[str] = None,
+        mm_pad_token_ids: Optional[set] = None,
         **kwargs,
     ):
         self._configure_device_env(
@@ -62,6 +63,10 @@ class LLMRayActor:
         engine_args = vllm.AsyncEngineArgs(*args, **self.kwargs)
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         await self.llm.is_sleeping()
+
+        # Used by generate() to collapse pre-expanded image/video pad tokens
+        # before passing to vLLM (avoids double-expansion).
+        self._mm_pad_token_ids = mm_pad_token_ids
 
     def _configure_device_env(self, backend, bundle_indices, num_gpus):
         if backend == "ray":
@@ -147,6 +152,14 @@ class LLMRayActor:
 
     async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None):
         """Token-level generation for rollout executors."""
+        if multi_modal_data and self._mm_pad_token_ids:
+            # Collapse consecutive image/video pad tokens to a single
+            # placeholder so vLLM's multimodal processor expands them
+            # exactly once (avoids double-expansion).
+            from openrlhf.utils.vlm_utils import dedup_media_tokens
+
+            prompt_token_ids = dedup_media_tokens(prompt_token_ids, self._mm_pad_token_ids)
+
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
@@ -211,6 +224,18 @@ def create_vllm_engines(
     max_images_per_prompt: int = 0,
 ):
     """Spin up a set of vLLM Ray actors with consistent placement."""
+    # Detect VLM pad token IDs once, shared across all engines.
+    mm_pad_token_ids: set = set()
+    if max_images_per_prompt > 0:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(pretrain, trust_remote_code=True)
+        for attr in ("image_token_id", "video_token_id"):
+            tid = getattr(processor, attr, None)
+            if tid is not None:
+                mm_pad_token_ids.add(tid)
+        del processor
+
     vllm_engines = []
     distributed_executor_backend = "uni" if tensor_parallel_size == 1 else "ray"
     use_hybrid_engine = shared_pg is not None
@@ -258,6 +283,7 @@ def create_vllm_engines(
             {
                 "agent_func_path": agent_func_path,
                 "remote_rm_url": remote_rm_url,
+                "mm_pad_token_ids": mm_pad_token_ids,
             }
         )
 
