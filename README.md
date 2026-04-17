@@ -53,6 +53,7 @@ OpenRLHF is **the first** high-performance, production-ready open-source RLHF fr
 <details>
 <summary>Show News</summary>
 
+- [2026/4] OpenRLHF 0.10 adds **Multi-Turn VLM RL** — multi-step interactions with images in both prompts and environment feedback (e.g. screenshots). Example: [vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
 - [2026/4] OpenRLHF 0.10 adds **VLM (Vision-Language Model) RLHF support** — train VLMs like Qwen3.5 with image inputs end-to-end. Training script: [train_vlm_math_hybrid_engine.sh](./examples/scripts/train_vlm_math_hybrid_engine.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) uses REINFORCE++-baseline to train a state-of-the-art 1.5B reasoning model with prolonged RL training. Training script: [train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
 - [2025/10] [ScaleRL](https://arxiv.org/abs/2510.13786) validates the effectiveness of REINFORCE++-baseline in large-scale training scenarios. Releases [REINFORCE++ slides](https://docs.google.com/presentation/d/1stieP_3PM1z4Hq1YWR3GywFkxcHEAlstXMaS23KlGN4)
@@ -253,16 +254,23 @@ OpenRLHF provides a complete RLHF pipeline with agent-based flexibility:
 - Multi-node training with [SLURM](./examples/scripts/train_ppo_ray_slurm.sh)
 
 **Model Support**
-- [VLM (Vision-Language Models)](./examples/scripts/train_vlm_math_hybrid_engine.sh) — tested with Qwen3.5 (`--image_key`, `--max_images_per_prompt`)
+- [VLM (Vision-Language Models)](./examples/scripts/train_vlm_math_hybrid_engine.sh) — single-turn and [multi-turn with image feedback](./examples/python/vlm_multiturn_agent.py) (`--image_key`, `--max_images_per_prompt`)
 - [LoRA/QLoRA](./examples/scripts/train_sft_mixtral_lora.sh) (`--lora_rank`, `--load_in_4bit`)
 - [Mixture of Experts (MoE)](./examples/test_scripts/train_sft_moe.sh) (`--aux_loss_coef`)
 - FlashAttention (`--attn_implementation`)
 - HuggingFace chat templates (`--apply_chat_template`)
 
+**Reward Shaping**
+- DAPO-style overlong penalty for length control (`--overlong_buffer_len`, `--overlong_penalty_factor`) — soft-penalize responses that exceed `max_new_tokens - overlong_buffer_len`
+- ProRL-style truncation penalty (`--stop_properly_penalty_coef`) — for samples with `finish_reason='length'`: `coef ∈ [0, 1]` multiplicatively scales the reward; `coef < 0` sets the reward to that fixed value (e.g. `-0.5`)
+
 **Production Features**
 - Wandb (`--use_wandb`) and TensorBoard (`--use_tensorboard`) logging
 - Checkpoint recovery (`--load_checkpoint`, `--save_steps`)
-- Evaluation datasets (`--eval_dataset`)
+- Best-checkpoint saving on eval metrics (`--best_metric_key`)
+- Evaluation datasets (`--eval_dataset`, `--eval_temperature`, `--eval_n_samples_per_prompt`) — supported in async training
+- Multi-process data loading (`--dataloader_num_workers`, available for PPO/SFT/RM/DPO)
+- PPO observability: actor/critic grad-norm and per-phase timing (`timing/make_experience`, `timing/ppo_train`, `timing/broadcast`, `timing/generation`, `timing/step_total`)
 
 </details>
 
@@ -481,12 +489,15 @@ ray job submit --address="http://127.0.0.1:8265" \
 # --advantage_estimator dr_grpo          # Dr. GRPO
 
 # Advanced Options:
-# --init_kl_coef 0                      # No reference model
-# --remote_rm_url http://host:5000/get_reward  # HTTP reward model
-# --n_samples_per_prompt 4              # Multiple samples per prompt
-# --enable_vllm_is_correction           # TIS (vLLM importance sampling correction) for off-policy rollouts (PPO only)
-# --vllm_is_truncated_threshold 0.5 5.0 # TIS truncation interval: [low, high]
-# --use_icepop                          # ICEPOP: set coefficients outside [low, high] to 0 (instead of clamp)
+# --init_kl_coef 0                                    # No reference model
+# --remote_rm_url http://host:5000/get_reward         # HTTP reward model
+# --n_samples_per_prompt 4                            # Multiple samples per prompt
+# --vllm_generate_batch_size 2048                     # Oversample at generation (> rollout_batch_size); requires --async_train
+# --enable_vllm_is_correction                         # vLLM importance sampling correction for off-policy rollouts
+# --vllm_is_correction_type tis                       # Correction type: tis (token clamp) | icepop (token filter) | seq-mask-tis (seq-level geom mean)
+# --vllm_is_truncated_threshold 0.5 5.0               # IS truncation interval: [low, high]
+# --best_metric_key eval_default_pass1                # Save best checkpoint by eval metric (empty = auto-detect first pass1, 'none' = disable)
+# --policy_loss_type gspo                             # Use GSPO policy loss variant (vs default 'ppo')
 ```
 
 > [!TIP]
@@ -667,6 +678,7 @@ ray job submit --address="http://127.0.0.1:8265" \
 - Single-turn: [train_ppo_ray_hybrid_engine.sh](./examples/scripts/train_ppo_ray_hybrid_engine.sh)
 - Custom reward: [train_ppo_with_reward_fn.sh](./examples/scripts/train_ppo_with_reward_fn.sh)
 - Multi-turn: [train_reinforce_baseline_ray_agent_async.sh](./examples/scripts/train_reinforce_baseline_ray_agent_async.sh)
+- Multi-turn VLM (image feedback): [vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
 
 ### OpenAI-Compatible Agent Server
 
@@ -705,29 +717,29 @@ python -m openrlhf.cli.lora_combiner \
 
 Optimize OpenRLHF for your hardware and workload with these recommendations:
 
-#### 🎯 Resource Allocation (Distributed Mode)
+#### 🎯 Execution Modes: Throughput vs. Stability
 
-**Recommended ratio**: `vLLM : Actor : Critic = 1:1:1`
+Pick the execution mode based on your priority — OpenRLHF gives you a clear tradeoff knob:
 
-```bash
-# Example: 70B model on 48 A100 GPUs
-# - 16 GPUs → vLLM Engine
-# - 16 GPUs → Actor
-# - 16 GPUs → Critic
-```
+| Mode | Flags | Characteristics | When to Use |
+|------|-------|-----------------|-------------|
+| **Hybrid Engine (colocated)** | `--colocate_all_models`<br>`--vllm_enable_sleep`<br>`--deepspeed_enable_sleep` | **Most stable** — strictly on-policy, every rollout uses the latest weights. Serial generate→train cycle. | Research, sensitive RL algorithms, reproducibility, recipe validation |
+| **Async Training** | `--async_train`<br>`--async_queue_size N` | **Highest throughput** — generation and training run in parallel. Tune off-policyness via `--async_queue_size` (larger = more off-policy). | Production throughput when convergence is already validated |
+| **Async + Partial Rollout** | `--async_train`<br>`--partial_rollout` | **Maximum overlap** — vLLM pause/resume instead of locking, in-flight samples may mix old/new weights. Most aggressive off-policy. | Pushing async throughput further; pair with `--enable_vllm_is_correction` |
 
-#### ⚡ Speed Optimizations
+> [!TIP]
+> The `vLLM : Actor : Critic = 1:1:1` rule of thumb no longer applies with Hybrid Engine — colocating models lets a single GPU pool serve generation, actor training, and critic training. Reserve 3-group splits only when you truly cannot fit all models together (e.g. 70B+ with short-memory hardware).
+
+#### ⚡ Other Speed Optimizations
 
 | Optimization | Flag | When to Use |
 |--------------|------|-------------|
-| **Hybrid Engine** | `--colocate_all_models`<br>`--vllm_enable_sleep`<br>`--deepspeed_enable_sleep` | Sufficient GPU memory |
-| **Async Training** | `--async_train` | Convergence validated, need throughput |
-| **Partial Rollout** | `--partial_rollout` | Async mode, maximize generation/training overlap |
 | **Sample Packing** | `--packing_samples` | Always (especially training) |
+| **Dynamic Batch** | `--use_dynamic_batch` | Variable sequence lengths |
 | **DeepCompile** | `--deepcompile` | PyTorch 2.0+ |
 | **Overlap Comm** | `--overlap_comm` | Sufficient GPU memory |
-| **Dynamic Batch** | `--use_dynamic_batch` | Variable sequence lengths |
 | **Prefix Caching** | vLLM config | `n_samples_per_prompt` > 1 |
+| **Oversampling** | `--vllm_generate_batch_size > --rollout_batch_size` | Async mode, to amortize generation cost / feed dynamic filtering |
 
 #### 💾 Memory Management
 

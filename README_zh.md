@@ -53,6 +53,7 @@ OpenRLHF 是**首个**结合 **Ray + vLLM 分布式架构**与**统一 Agent 设
 <details>
 <summary>展开新闻</summary>
 
+- [2026/4] OpenRLHF 0.10 新增 **多轮 VLM RL** — 支持 prompt 和环境反馈（如截图）中均包含图像的多步交互。示例：[vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
 - [2026/4] OpenRLHF 0.10 新增 **VLM（视觉语言模型）RLHF 支持** — 支持 Qwen3.5 等 VLM 的端到端图像输入训练。训练脚本：[train_vlm_math_hybrid_engine.sh](./examples/scripts/train_vlm_math_hybrid_engine.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) 使用 REINFORCE++-baseline 通过长期 RL 训练训练最先进的 1.5B 推理模型。训练脚本：[train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
 - [2025/10] [ScaleRL](https://arxiv.org/abs/2510.13786) 验证了 REINFORCE++-baseline 在大规模训练场景中的有效性。发布 [REINFORCE++ PPT](https://docs.google.com/presentation/d/1stieP_3PM1z4Hq1YWR3GywFkxcHEAlstXMaS23KlGN4)
@@ -254,16 +255,23 @@ OpenRLHF 提供完整的 RLHF 流程，具有基于 Agent 的灵活性：
 - 使用 [SLURM](./examples/scripts/train_ppo_ray_slurm.sh) 的多节点训练
 
 **模型支持**
-- [VLM（视觉语言模型）](./examples/scripts/train_vlm_math_hybrid_engine.sh) — 已测试 Qwen3.5（`--image_key`、`--max_images_per_prompt`）
+- [VLM（视觉语言模型）](./examples/scripts/train_vlm_math_hybrid_engine.sh) — 支持单轮和[含图像反馈的多轮交互](./examples/python/vlm_multiturn_agent.py)（`--image_key`、`--max_images_per_prompt`）
 - [LoRA/QLoRA](./examples/scripts/train_sft_mixtral_lora.sh)（`--lora_rank`、`--load_in_4bit`）
 - [专家混合（MoE）](./examples/test_scripts/train_sft_moe.sh)（`--aux_loss_coef`）
 - FlashAttention（`--attn_implementation`）
 - HuggingFace 聊天模板（`--apply_chat_template`）
 
+**奖励塑形**
+- DAPO 风格超长惩罚（`--overlong_buffer_len`、`--overlong_penalty_factor`）——对超过 `max_new_tokens - overlong_buffer_len` 的响应进行软惩罚
+- ProRL 风格截断惩罚（`--stop_properly_penalty_coef`）——对 `finish_reason='length'` 的样本：`coef ∈ [0, 1]` 表示乘法缩放奖励；`coef < 0` 表示将奖励直接覆盖为该固定值（例如 `-0.5`）
+
 **生产特性**
 - Wandb（`--use_wandb`）和 TensorBoard（`--use_tensorboard`）日志
 - 检查点恢复（`--load_checkpoint`、`--save_steps`）
-- 评估数据集（`--eval_dataset`）
+- 基于评估指标保存最佳检查点（`--best_metric_key`）
+- 评估数据集（`--eval_dataset`、`--eval_temperature`、`--eval_n_samples_per_prompt`）——支持异步训练中的评估
+- 多进程数据加载（`--dataloader_num_workers`，PPO/SFT/RM/DPO 均支持）
+- PPO 可观测性：actor/critic grad-norm 以及各阶段耗时细分（`timing/make_experience`、`timing/ppo_train`、`timing/broadcast`、`timing/generation`、`timing/step_total`）
 
 </details>
 
@@ -480,12 +488,15 @@ ray job submit --address="http://127.0.0.1:8265" \
 # --advantage_estimator dr_grpo          # Dr. GRPO
 
 # 高级选项：
-# --init_kl_coef 0                      # 无参考模型
-# --remote_rm_url http://host:5000/get_reward  # HTTP 奖励模型
-# --n_samples_per_prompt 4              # 每个提示多个样本
-# --enable_vllm_is_correction           # TIS（vLLM 重要性采样修正）：用于 off-policy rollout（仅 PPO 生效）
-# --vllm_is_truncated_threshold 0.5 5.0 # TIS 截断区间：[low, high]
-# --use_icepop                          # ICEPOP：将区间外系数置 0（而不是 clamp）
+# --init_kl_coef 0                                    # 无参考模型
+# --remote_rm_url http://host:5000/get_reward         # HTTP 奖励模型
+# --n_samples_per_prompt 4                            # 每个提示多个样本
+# --vllm_generate_batch_size 2048                     # 生成阶段过采样（> rollout_batch_size）；需要配合 --async_train
+# --enable_vllm_is_correction                         # vLLM 重要性采样修正，用于 off-policy rollout
+# --vllm_is_correction_type tis                       # 修正类型：tis（token clamp）| icepop（token 过滤）| seq-mask-tis（序列级几何平均）
+# --vllm_is_truncated_threshold 0.5 5.0               # IS 截断区间：[low, high]
+# --best_metric_key eval_default_pass1                # 按评估指标保存最佳检查点（留空自动探测首个 pass1，'none' 禁用）
+# --policy_loss_type gspo                             # 使用 GSPO 策略损失变体（默认为 'ppo'）
 ```
 
 > [!TIP]
@@ -665,7 +676,8 @@ ray job submit --address="http://127.0.0.1:8265" \
 - 单轮：[train_ppo_ray_hybrid_engine.sh](./examples/scripts/train_ppo_ray_hybrid_engine.sh)
 - 自定义奖励：[train_ppo_with_reward_fn.sh](./examples/scripts/train_ppo_with_reward_fn.sh)
 - 多轮：[train_reinforce_baseline_ray_agent_async.sh](./examples/scripts/train_reinforce_baseline_ray_agent_async.sh)
-- OpenAI Agent Server：`examples/python/agent_func_openai_server_executor.py`
+- 多轮 VLM（图像反馈）：[vlm_multiturn_agent.py](./examples/python/vlm_multiturn_agent.py)
+- OpenAI Agent Server：[agent_func_openai_server_executor.py](./examples/python/agent_func_openai_server_executor.py)
 
 ---
 
@@ -689,28 +701,29 @@ python -m openrlhf.cli.lora_combiner \
 
 通过以下建议针对您的硬件和工作负载优化 OpenRLHF：
 
-#### 🎯 资源分配（分布式模式）
+#### 🎯 执行模式：吞吐 vs. 稳定性
 
-**推荐比例**：`vLLM : Actor : Critic = 1:1:1`
+根据优先级选择执行模式——OpenRLHF 提供清晰的取舍旋钮：
 
-```bash
-# 示例：48 个 A100 GPU 上的 70B 模型
-# - 16 个 GPU → vLLM 引擎
-# - 16 个 GPU → Actor
-# - 16 个 GPU → Critic
-```
+| 模式 | 相关参数 | 特性 | 适用场景 |
+|------|---------|------|---------|
+| **混合引擎（colocated）** | `--colocate_all_models`<br>`--vllm_enable_sleep`<br>`--deepspeed_enable_sleep` | **最稳定** ——严格 on-policy，每次 rollout 使用最新权重，生成→训练串行执行 | 研究、对 off-policy 敏感的 RL 算法、复现、配方验证 |
+| **异步训练** | `--async_train`<br>`--async_queue_size N` | **最快** ——生成与训练并行执行，通过 `--async_queue_size` 调控异步程度（越大越 off-policy） | 收敛已验证后的生产吞吐场景 |
+| **异步 + 部分 rollout** | `--async_train`<br>`--partial_rollout` | **最大化重叠** ——使用 vLLM pause/resume 替代加锁，in-flight 样本可能混合新旧权重；异步程度最激进 | 进一步压榨异步吞吐；建议搭配 `--enable_vllm_is_correction` |
 
-#### ⚡ 速度优化
+> [!TIP]
+> 过去的 `vLLM : Actor : Critic = 1:1:1` 经验法则在混合引擎下已不再适用——colocate 后单个 GPU 池可同时服务生成、actor 训练和 critic 训练。仅当确实无法把所有模型放在一起时（例如 70B+ 显存不足），才考虑三组拆分。
+
+#### ⚡ 其他速度优化
 
 | 优化 | 标志 | 何时使用 |
 |------|------|---------|
-| **混合引擎** | `--colocate_all_models`<br>`--vllm_enable_sleep`<br>`--deepspeed_enable_sleep` | GPU 内存充足 |
-| **异步训练** | `--async_train` | 收敛已验证，需要吞吐量 |
 | **样本打包** | `--packing_samples` | 始终（尤其是训练） |
+| **动态批次** | `--use_dynamic_batch` | 可变序列长度 |
 | **DeepCompile** | `--deepcompile` | PyTorch 2.0+ |
 | **重叠通信** | `--overlap_comm` | GPU 内存充足 |
-| **动态批次** | `--use_dynamic_batch` | 可变序列长度 |
 | **前缀缓存** | vLLM 配置 | `n_samples_per_prompt` > 1 |
+| **生成过采样** | `--vllm_generate_batch_size > --rollout_batch_size` | 异步模式下摊薄生成开销 / 喂养动态过滤 |
 
 #### 💾 内存管理
 
