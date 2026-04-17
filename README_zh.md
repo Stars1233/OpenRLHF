@@ -711,9 +711,6 @@ python -m openrlhf.cli.lora_combiner \
 | **异步训练** | `--async_train`<br>`--async_queue_size N` | **最快** ——生成与训练并行执行，通过 `--async_queue_size` 调控异步程度（越大越 off-policy） | 收敛已验证后的生产吞吐场景 |
 | **异步 + 部分 rollout** | `--async_train`<br>`--partial_rollout` | **最大化重叠** ——使用 vLLM pause/resume 替代加锁，in-flight 样本可能混合新旧权重；异步程度最激进 | 进一步压榨异步吞吐；建议搭配 `--enable_vllm_is_correction` |
 
-> [!TIP]
-> 过去的 `vLLM : Actor : Critic = 1:1:1` 经验法则在混合引擎下已不再适用——colocate 后单个 GPU 池可同时服务生成、actor 训练和 critic 训练。仅当确实无法把所有模型放在一起时（例如 70B+ 显存不足），才考虑三组拆分。
-
 #### ⚡ 其他速度优化
 
 | 优化 | 标志 | 何时使用 |

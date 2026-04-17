@@ -727,9 +727,6 @@ Pick the execution mode based on your priority — OpenRLHF gives you a clear tr
 | **Async Training** | `--async_train`<br>`--async_queue_size N` | **Highest throughput** — generation and training run in parallel. Tune off-policyness via `--async_queue_size` (larger = more off-policy). | Production throughput when convergence is already validated |
 | **Async + Partial Rollout** | `--async_train`<br>`--partial_rollout` | **Maximum overlap** — vLLM pause/resume instead of locking, in-flight samples may mix old/new weights. Most aggressive off-policy. | Pushing async throughput further; pair with `--enable_vllm_is_correction` |
 
-> [!TIP]
-> The `vLLM : Actor : Critic = 1:1:1` rule of thumb no longer applies with Hybrid Engine — colocating models lets a single GPU pool serve generation, actor training, and critic training. Reserve 3-group splits only when you truly cannot fit all models together (e.g. 70B+ with short-memory hardware).
-
 #### ⚡ Other Speed Optimizations
 
 | Optimization | Flag | When to Use |
