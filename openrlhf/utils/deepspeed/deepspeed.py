@@ -1,11 +1,13 @@
 import gc
 import json
+import math
 import os
 import shutil
 from abc import ABC
 from collections import defaultdict
 from datetime import timedelta
-from typing import List, Tuple, Union
+from functools import partial
+from typing import Optional
 
 import deepspeed
 import torch
@@ -13,26 +15,23 @@ import torch.nn as nn
 import torch.optim as optim
 import transformers
 import transformers.modeling_flash_attention_utils
-from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from peft import PeftModel, get_peft_model_state_dict
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers.trainer import get_scheduler
 
 from openrlhf.models import Actor
 from openrlhf.models.ring_attn_utils import get_ring_attn_group, set_ring_attn_group
 from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync
+
 from .deepspeed_utils import (
     _z3_params_to_fetch,
     get_eval_ds_config,
     get_optimizer_grouped_parameters,
     get_train_ds_config,
 )
-
-ModelOptimPair = Tuple[nn.Module, Optimizer]
-ModelOrModelOptimPair = Union[nn.Module, ModelOptimPair]
 
 
 class DeepspeedStrategy(ABC):
@@ -58,26 +57,26 @@ class DeepspeedStrategy(ABC):
         self.stage = zero_stage
         self.train_batch_size = train_batch_size
         self.micro_train_batch_size = micro_train_batch_size
-        self.param_dtype = args.param_dtype  # default: bf16
+        self.param_dtype = args.ds.param_dtype  # default: bf16
         self.seed = seed
         self.full_determinism = full_determinism
         self.max_norm = max_norm
 
-        self.adam_offload = getattr(args, "adam_offload", False)
-        self.zpg = getattr(args, "zpg", 1)
-        self.use_ds_universal_ckpt = getattr(args, "use_ds_universal_ckpt", False)
-        self.grad_accum_dtype = getattr(args, "grad_accum_dtype", None)
-        self.overlap_comm = getattr(args, "overlap_comm", False)
-        self.deepcompile = getattr(args, "deepcompile", False)
-        self.ds_tensor_parallel_size = getattr(args, "ds_tensor_parallel_size", 1)
-        self.ring_attn_size = getattr(self.args, "ring_attn_size", 1)
-        self.use_dynamic_batch = getattr(self.args, "use_dynamic_batch", False)
+        self.optim = getattr(args, "optim", "adam")
+        self.adam_offload = getattr(args.ds, "adam_offload", False)
+        self.zpg = getattr(args.ds, "zpg", 1)
+        self.use_ds_universal_ckpt = getattr(args.ds, "use_universal_ckpt", False)
+        self.grad_accum_dtype = getattr(args.ds, "grad_accum_dtype", None)
+        self.overlap_comm = getattr(args.ds, "overlap_comm", False)
+        self.deepcompile = getattr(args.ds, "deepcompile", False)
+        self.ds_tensor_parallel_size = getattr(args.ds, "tensor_parallel_size", 1)
+        self.ring_attn_size = getattr(args.ds, "ring_attn_size", 1)
+        self.use_dynamic_batch = getattr(self.args.train, "dynamic_batch_enable", False)
 
         if self.ds_tensor_parallel_size > 1:
             assert deepspeed.version >= "0.16.4", "DeepSpeed version must be >= 0.16.4 for tensor parallel training"
             assert self.param_dtype == "bf16", "BF16 is required for tensor parallel training"
 
-        self.is_rlhf = False
         self.time_steps = defaultdict(int)
 
     def setup_distributed(self, timeout=timedelta(minutes=60)) -> None:
@@ -126,37 +125,67 @@ class DeepspeedStrategy(ABC):
         self.ring_attn_rank = dist.get_rank(group=group)
         set_ring_attn_group(group)
 
+        from openrlhf.models.ring_attn_utils import patch_transformers_for_ring_flash_attn
+
+        patch_transformers_for_ring_flash_attn()
         from ring_flash_attn import substitute_hf_flash_attn
 
-        self.ring_head_stride = getattr(self.args, "ring_head_stride", 1)
+        self.ring_head_stride = getattr(self.args.ds, "ring_attn_head_stride", 1)
         substitute_hf_flash_attn(self.ring_attn_group, self.ring_head_stride)
 
     @property
     def ring_attn_group(self):
         return get_ring_attn_group()
 
-    def create_optimizer(self, model, **kwargs) -> Optimizer:
-        if isinstance(model, Actor):
-            model = model.model
-        # Optimizer
-        AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
-        optim_params = get_optimizer_grouped_parameters(model, kwargs["weight_decay"])
-        optim = AdamOptimizer(optim_params, **kwargs)
-        return optim
+    def _get_model_parameters(self, model: nn.Module, *, optim: Optional[str] = None, weight_decay: float = 0.0):
+        # ``optim`` defaults to the strategy-wide setting but can be overridden per-model
+        # so actor/critic can disagree (e.g. actor=muon, critic=adam).
+        # ``weight_decay`` is the user-requested decay for the decaying group;
+        # bias/LayerNorm are always exempted (weight_decay=0.0) for the Adam path.
+        if optim is None:
+            optim = self.optim
+        raw_model = model.model if isinstance(model, Actor) else model
+        if optim == "muon":
+            from packaging import version
 
-    def backward(self, loss: torch.Tensor, model: nn.Module, optimizer: optim.Optimizer, **kwargs) -> None:
+            assert version.parse(deepspeed.__version__) >= version.parse(
+                "0.18.2"
+            ), f"Muon optimizer requires deepspeed >= 0.18.2, got {deepspeed.__version__}"
+            # Muon for internal 2-D weight matrices; Adam for embeddings, classifier/value heads, and 1-D params.
+            # DS Muon dispatches based on the `use_muon` attribute per parameter.
+            # Covers LLaMA/Mistral/Qwen (embed_tokens), GPT-2 (wte/wpe), and RM/PPO critic value heads.
+            _muon_exclude = {"embed", "lm_head", "wte", "wpe"}
+            value_head_prefix = getattr(raw_model, "value_head_prefix", None)
+            for name, param in raw_model.named_parameters():
+                top_level_name = name.split(".", 1)[0]
+                is_value_head = value_head_prefix is not None and top_level_name == value_head_prefix
+                param.use_muon = param.ndim >= 2 and not is_value_head and not any(k in name for k in _muon_exclude)
+            # DS Muon (engine.py 1597-1611) partitions a flat Parameter list via p.use_muon
+            # and refuses param-group dicts; it also applies a single scalar weight_decay
+            # to both the Muon and aux-Adam groups. Splitting groups post-init would desync
+            # ZeRO's cached bit16_groups/fp32_groups metadata (new groups never get stepped),
+            # so bias/LayerNorm decay exemption under Muon is NOT applied here -- DS limitation.
+            model_parameters = [param for param in raw_model.parameters() if param.requires_grad]
+        else:
+            # Adam: exempt bias/layernorm from weight decay.
+            model_parameters = get_optimizer_grouped_parameters(raw_model, weight_decay)
+        return raw_model, model_parameters
+
+    def backward(self, loss: torch.Tensor, model: nn.Module, _optimizer: optim.Optimizer, **kwargs) -> None:
+        # _optimizer kept for strategy interface compatibility; DS engine handles it internally.
         if isinstance(model, Actor):
             model = model.model
         model.backward(loss)
 
     def optimizer_step(
         self,
-        optimizer: optim.Optimizer,
+        _optimizer: optim.Optimizer,
         model: nn.Module,
-        scheduler,
+        _scheduler,
         name="model",
         **kwargs,
     ) -> None:
+        # Parameters are kept for strategy interface compatibility.
         if isinstance(model, Actor):
             model = model.model
         model.step()
@@ -220,26 +249,110 @@ class DeepspeedStrategy(ABC):
         else:
             return model
 
-    def prepare(
-        self, *models_or_model_optim_pairs: ModelOrModelOptimPair, is_rlhf=False
-    ) -> Union[List[ModelOrModelOptimPair], ModelOrModelOptimPair]:
+    def prepare(self, *args):
+        """Prepare models for training/evaluation.
+
+        Each arg is one of:
+
+        * ``(model, cfg)`` — training.  ``cfg`` is a dict like::
+
+            {
+              "optim": "muon" | "adam",          # selector
+              "muon":  {lr, momentum},           # Muon-specific; lr shared w/ aux-Adam
+              "adam":  {lr, betas, eps, weight_decay},
+              "lr_scheduler": str,
+              "lr_warmup_ratio": float,
+              "min_lr_ratio": float,
+              "max_norm": float,                 # gradient clip
+              "scheduler_steps": int,
+            }
+
+          When ``optim="muon"``, the Muon group uses ``muon.lr`` / ``muon.momentum``;
+          the aux-Adam subgroup uses ``adam.betas`` / ``adam.eps``; ``adam.weight_decay``
+          is shared (DS v0.18.2 uses one ``weight_decay`` for both groups).
+        * ``model`` — evaluation only, no optimizer.
+
+        Returns ``(model, optimizer, scheduler)`` for training entries and the
+        wrapped model for eval entries.
+        """
         ret = []
-        self.is_rlhf = is_rlhf
-        for arg in models_or_model_optim_pairs:
+        for arg in args:
             if isinstance(arg, tuple):
-                assert len(arg) == 3, f'Expect (model, optimizer, scheduler) pair, got a tuple with size "{len(arg)}"'
-                if arg[0] is not None:
-                    ret.append(self._ds_init_train_model(*arg))
-                else:
+                assert len(arg) == 2, f"prepare() tuple must be (model, cfg); got len={len(arg)}"
+                model, cfg = arg
+                if model is None:
                     ret.append((None, None, None))
+                else:
+                    ret.append(self._ds_init_train_model(model, cfg))
             else:
                 ret.append(self._ds_init_eval_model(arg))
 
         return ret[0] if len(ret) == 1 else ret
 
-    def _ds_init_train_model(self, model, optim, scheduler):
+    def _ds_init_train_model(self, model, cfg: dict):
+        # DS v0.18.2 optimizer-config whitelists (engine.py:1600-1611):
+        #   AdamW:  {lr, betas, eps, weight_decay}
+        #   Muon:   muon group -> {lr, momentum, weight_decay}
+        #           aux-Adam   -> {lr, betas, eps, weight_decay}   (lr/weight_decay shared)
+        # Keys outside these sets are silently dropped.  ns_steps / nesterov are
+        # NOT configurable via DS config in v0.18.2 (hard-coded: ns_steps=5, nesterov=True).
+        kind = cfg["optim"]
+        adam = cfg["adam"]
+        if kind == "muon":
+            muon = cfg["muon"]
+            # DS engine.py:1645,1654 reads `muon_lr` / `adam_lr` from the config
+            # and uses them to OVERRIDE the per-group lr at param-group construction.
+            # Without these keys, both groups silently inherit the same top-level lr —
+            # which meant embeddings/head/value_head were trained at Muon lr (0.02).
+            # Emit both explicitly so the two groups follow their own initial lrs;
+            # the HF scheduler then drives each group independently.
+            #
+            # ns_steps / nesterov: DS v0.18.x Muon hard-codes ns_steps=5, nesterov=True
+            # inside muon_update() and does NOT accept them via config. We expose the
+            # CLI knobs as placeholders; warn when the user sets a non-default value.
+            if muon.get("ns_steps", 5) != 5 or not muon.get("nesterov", True):
+                import warnings as _warnings
+                import deepspeed as _ds
+
+                _warnings.warn(
+                    f"muon.ns_steps / muon.nesterov are placeholders: DeepSpeed "
+                    f"{getattr(_ds, '__version__', '?')} hard-codes ns_steps=5, "
+                    f"nesterov=True inside muon_update() and ignores config overrides.",
+                    stacklevel=2,
+                )
+            optim_dict = {
+                "type": "Muon",
+                "params": {
+                    "lr": muon["lr"],  # fallback for param-groups with no override
+                    "muon_lr": muon["lr"],  # explicit override for the Muon group
+                    "adam_lr": adam["lr"],  # explicit override for the aux-Adam group
+                    "momentum": muon["momentum"],
+                    "betas": list(adam["betas"]),  # aux-Adam only
+                    "eps": adam["eps"],  # aux-Adam only
+                    "weight_decay": adam["weight_decay"],  # shared by both groups (DS scalar)
+                },
+            }
+        else:
+            optim_dict = {
+                "type": "AdamW",
+                "params": {
+                    "lr": adam["lr"],
+                    "betas": list(adam["betas"]),
+                    "eps": adam["eps"],
+                    "weight_decay": adam["weight_decay"],
+                },
+            }
+        scheduler_steps = cfg["scheduler_steps"]
+        sched_factory = partial(
+            get_scheduler,
+            cfg.get("lr_scheduler", "cosine_with_min_lr"),
+            num_warmup_steps=math.ceil(scheduler_steps * cfg.get("lr_warmup_ratio", 0.03)),
+            num_training_steps=scheduler_steps,
+            scheduler_specific_kwargs={"min_lr_rate": cfg.get("min_lr_ratio", 0.1)},
+        )
+
         is_actor = isinstance(model, Actor)
-        ds_config = self.get_ds_train_config(is_actor)
+        ds_config = self.get_ds_train_config(optim_dict=optim_dict, max_norm=cfg.get("max_norm", 1.0))
 
         if self.ds_tensor_parallel_size > 1:
             tp_model = deepspeed.tp_model_init(
@@ -249,27 +362,39 @@ class DeepspeedStrategy(ABC):
                 model.model = tp_model
             else:
                 model = tp_model
-
-            # Recreate optimizer over sharded params to free pre-sharded weight references.
-            # Without this, the old optimizer still pins the full (unsharded) tensors in GPU
-            # memory, causing OOM when deepspeed.initialize() allocates gradient partitions.
-            old_defaults = optim.defaults.copy()
-            if scheduler is not None:
-                scheduler.optimizer = None
-            optim = self.create_optimizer(model, **old_defaults)
-            if scheduler is not None:
-                scheduler.optimizer = optim
             gc.collect()
             torch.cuda.empty_cache()
 
-        engine, optim, _, scheduler = deepspeed.initialize(
-            model=model.model if is_actor else model,
-            optimizer=optim,
-            lr_scheduler=scheduler,
-            config=ds_config,
-            args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
-            dist_init_required=True,
+        # Infer optim kind from the DS type so actor/critic can disagree.
+        optim_kind = "muon" if optim_dict.get("type") == "Muon" else "adam"
+        raw_model, model_parameters = self._get_model_parameters(
+            model, optim=optim_kind, weight_decay=adam["weight_decay"]
         )
+
+        # DS __init__.py:69-75 (set_optimizer_flags) overwrites every param's
+        # use_muon attribute using a substring rule that mis-classifies value_head
+        # (sent to Muon — wrong per Keller Jordan) and GPT-2 wte/wpe (also sent to
+        # Muon because they do not contain the "embed" substring). Our
+        # _get_model_parameters() above already set use_muon correctly with the
+        # project-specific exclusions; no-op DS's override for the duration of
+        # initialize() and restore afterwards.
+        _ds_set_flags_orig = getattr(deepspeed, "set_optimizer_flags", None)
+        if optim_kind == "muon" and _ds_set_flags_orig is not None:
+            deepspeed.set_optimizer_flags = lambda *args, **kwargs: None
+        try:
+            engine, optim, _, scheduler = deepspeed.initialize(
+                model=raw_model,
+                optimizer=None,
+                model_parameters=model_parameters,
+                lr_scheduler=sched_factory,
+                config=ds_config,
+                args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
+                dist_init_required=True,
+            )
+        finally:
+            if _ds_set_flags_orig is not None:
+                deepspeed.set_optimizer_flags = _ds_set_flags_orig
+
         if self.deepcompile:
             engine.compile()
         if is_actor:
@@ -279,20 +404,29 @@ class DeepspeedStrategy(ABC):
 
         return model, optim, scheduler
 
-    def get_ds_train_config(self, is_actor):
-        # DS Config
+    def get_ds_train_config(
+        self, optim_dict: Optional[dict] = None, *, max_norm: Optional[float] = None, is_actor=None
+    ):
+        # ``optim_dict`` is None when called from HF model-loading paths (e.g.
+        # ``Actor.from_pretrained``) that only need the ZeRO + bf16 parts — the
+        # optimizer section is filled later at ``prepare()`` time.
+        # ``max_norm`` is per-model (set by prepare's cfg); falls back to
+        # ``self.max_norm`` if not provided (for legacy model-loading callers).
+        # ``is_actor`` is accepted for legacy call sites and unused here.
+        del is_actor
         ds_config = get_train_ds_config(
             offload=False,
             adam_offload=self.adam_offload,
             stage=self.stage,
             param_dtype=self.param_dtype,
-            max_norm=self.max_norm,
+            max_norm=max_norm if max_norm is not None else self.max_norm,
             zpg=self.zpg,
             grad_accum_dtype=self.grad_accum_dtype,
             overlap_comm=self.overlap_comm,
             use_ds_universal_ckpt=self.use_ds_universal_ckpt,
             deepcompile=self.deepcompile,
             tensor_parallel_size=self.ds_tensor_parallel_size,
+            optim_config=optim_dict,
         )
         if self.use_dynamic_batch:
             ds_config["train_micro_batch_size_per_gpu"] = 1
@@ -313,7 +447,7 @@ class DeepspeedStrategy(ABC):
             tp_model = deepspeed.tp_model_init(
                 model=model.model if is_actor else model, tp_size=self.ds_tensor_parallel_size, dtype=torch.bfloat16
             )
-            if is_actor:
+            if isinstance(model, Actor):
                 model.model = tp_model
             else:
                 model = tp_model
@@ -384,7 +518,7 @@ class DeepspeedStrategy(ABC):
         model_to_save = self._unwrap_model(model)
 
         # gather parameters
-        if self.args.zero_stage > 2 or self.args.ds_tensor_parallel_size > 1:
+        if self.args.ds.zero_stage > 2 or self.args.ds.tensor_parallel_size > 1:
             output_state_dict = (
                 model.model._consolidated_16bit_state_dict()
                 if isinstance(model, Actor)

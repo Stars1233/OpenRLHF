@@ -56,41 +56,41 @@ srun --overlap --nodes=1 --ntasks=1 -w "$node_1" --container-image="$IMAGE_NAME"
 && /root/.local/bin/ray job submit --address=http://localhost:8265 \
     --runtime-env-json='{\"working_dir\": \"/openrlhf\", \"pip\": \"/openrlhf/requirements.txt\"}' \
     -- python3 -m openrlhf.cli.train_ppo_ray \
-    --ref_num_nodes 1 \
-    --ref_num_gpus_per_node 4 \
-    --reward_num_nodes 1 \
-    --reward_num_gpus_per_node 4 \
-    --critic_num_nodes 1 \
-    --critic_num_gpus_per_node 4 \
-    --actor_num_nodes 1 \
-    --actor_num_gpus_per_node 4 \
-    --vllm_num_engines 4 \
-    --vllm_tensor_parallel_size 2 \
-    --colocate_critic_reward \
-    --colocate_actor_ref \
-    --pretrain OpenRLHF/Llama-3-8b-sft-mixture \
-    --reward_pretrain OpenRLHF/Llama-3-8b-rm-mixture \
-    --save_path /openrlhf/examples/checkpoint/llama3-8b-rlhf \
-    --micro_train_batch_size 8 \
-    --train_batch_size 128 \
-    --micro_rollout_batch_size 16 \
-    --rollout_batch_size 1024 \
-    --max_samples 100000 \
-    --max_epochs 1 \
-    --max_len 2048 \
-    --zero_stage 3 \
-    --param_dtype bf16 \
-    --actor_learning_rate 5e-7 \
-    --critic_learning_rate 9e-6 \
-    --init_kl_coef 0.01 \
-    --prompt_data OpenRLHF/prompt-collection-v0.1 \
-    --input_key context_messages \
-    --apply_chat_template \
-    --normalize_reward \
-    --adam_offload \
-    --packing_samples \
-    --vllm_sync_backend nccl \
-    --gradient_checkpointing \
-    --use_wandb {wandb_token}" &>> ${JOBLOG}
+    --ref.num_nodes 1 \
+    --ref.num_gpus_per_node 4 \
+    --reward.num_nodes 1 \
+    --reward.num_gpus_per_node 4 \
+    --critic.num_nodes 1 \
+    --critic.num_gpus_per_node 4 \
+    --actor.num_nodes 1 \
+    --actor.num_gpus_per_node 4 \
+    --vllm.num_engines 4 \
+    --vllm.tensor_parallel_size 2 \
+    --train.colocate_critic_reward \
+    --train.colocate_actor_ref \
+    --actor.model_name_or_path OpenRLHF/Llama-3-8b-sft-mixture \
+    --reward.model_name_or_path OpenRLHF/Llama-3-8b-rm-mixture \
+    --ckpt.output_dir /openrlhf/examples/checkpoint/llama3-8b-rlhf \
+    --train.micro_batch_size 8 \
+    --train.batch_size 128 \
+    --rollout.micro_batch_size 16 \
+    --rollout.batch_size 1024 \
+    --data.max_samples 100000 \
+    --train.max_epochs 1 \
+    --data.max_len 2048 \
+    --ds.zero_stage 3 \
+    --ds.param_dtype bf16 \
+    --actor.adam.lr 5e-7 \
+    --critic.adam.lr 9e-6 \
+    --algo.kl.init_coef 0.01 \
+    --data.prompt_dataset OpenRLHF/prompt-collection-v0.1 \
+    --data.input_key context_messages \
+    --data.apply_chat_template \
+    --reward.normalize_enable \
+    --ds.adam_offload \
+    --ds.packing_samples \
+    --vllm.sync_backend nccl \
+    --actor.gradient_checkpointing_enable \
+    --logger.wandb.key {wandb_token}" &>> ${JOBLOG}
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') Job ${SLURM_JOB_ID} stopped ..." &>> ${JOBLOG}

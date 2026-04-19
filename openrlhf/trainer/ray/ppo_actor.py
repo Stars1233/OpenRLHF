@@ -1,4 +1,3 @@
-import math
 import os
 import socket
 from abc import ABC
@@ -12,14 +11,16 @@ import torch.distributed
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers.trainer import get_scheduler
 
 from openrlhf.models import Actor, PolicyLoss
 from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.trainer.ppo_utils.experience import Experience
 from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
-from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
+from openrlhf.utils.deepspeed.deepspeed_utils import (
+    offload_deepspeed_states,
+    reload_deepspeed_states,
+)
 from openrlhf.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.vlm_utils import merge_mm_train_inputs
@@ -69,34 +70,36 @@ class ActorPPOTrainer(ABC):
         self.actor_optim = actor_optim
         self.actor_scheduler = actor_scheduler
         self.vllm_engines = vllm_engines
-        self.max_epochs = self.args.max_epochs
+        self.max_epochs = self.args.train.max_epochs
 
         self.actor_loss_fn = PolicyLoss(
-            clip_eps_low=self.args.eps_clip_low_high[0],
-            clip_eps_high=self.args.eps_clip_low_high[1],
-            dual_clip=self.args.dual_clip,
-            policy_loss_type=self.args.policy_loss_type,
-            enable_vllm_is_correction=self.args.enable_vllm_is_correction,
+            clip_eps_low=self.args.actor.eps_clip_low_high[0],
+            clip_eps_high=self.args.actor.eps_clip_low_high[1],
+            dual_clip=self.args.actor.dual_clip,
+            policy_loss_type=self.args.actor.policy_loss_type,
+            enable_vllm_is_correction=self.args.algo.advantage.is_correction_enable,
             vllm_is_truncated_threshold=(
-                self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
+                self.args.algo.advantage.is_correction_threshold
+                if self.args.algo.advantage.is_correction_enable
+                else None
             ),
-            vllm_is_correction_type=self.args.vllm_is_correction_type,
+            vllm_is_correction_type=self.args.algo.advantage.is_correction_type,
         )
 
         # Mixtral 8x7b
-        self.aux_loss = self.args.aux_loss_coef > 1e-8
+        self.aux_loss = self.args.actor.aux_loss_coef > 1e-8
 
         self.replay_buffer = NaiveReplayBuffer(
             micro_train_batch_size,
             buffer_limit,
             buffer_cpu_offload,
-            getattr(self.args, "packing_samples", False),
-            self.args.use_dynamic_batch,
+            getattr(self.args.data, "packing_samples", False),
+            self.args.train.dynamic_batch_enable,
         )
 
         # Init torch group for weights sync
-        backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
-        self.use_cuda_ipc = backend == "nccl" and self.args.colocate_all_models and not self.args.async_train
+        backend = getattr(self.strategy.args.vllm, "sync_backend", "nccl")
+        self.use_cuda_ipc = backend == "nccl" and self.args.train.colocate_all and not self.args.train.async_enable
 
         if self.vllm_engines is not None and not self.use_cuda_ipc and torch.distributed.get_rank() == 0:
             self._init_vllm_sync_group(backend)
@@ -118,11 +121,11 @@ class ActorPPOTrainer(ABC):
             sock.bind(("", 0))
             master_port = sock.getsockname()[1]
 
-        vllm_num_engines = self.strategy.args.vllm_num_engines
-        vllm_tensor_parallel_size = self.strategy.args.vllm_tensor_parallel_size
+        vllm_num_engines = self.strategy.args.vllm.num_engines
+        vllm_tensor_parallel_size = self.strategy.args.vllm.tensor_parallel_size
         world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
 
-        use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+        use_ray = getattr(self.strategy.args.vllm, "sync_with_ray", False)
         group_name = "openrlhf"
         refs = [
             engine.init_process_group.remote(
@@ -150,13 +153,13 @@ class ActorPPOTrainer(ABC):
 
     def ppo_train(self, kl_ctl: float):
         # replay buffer may be empty at first, we should rebuild at each training
-        if self.args.use_dynamic_batch:
+        if self.args.train.dynamic_batch_enable:
             self.replay_buffer.setup_dynamic_batch(self.strategy)
 
         should_shuffle = (
             self.strategy.ring_attn_group is None
-            and self.args.ds_tensor_parallel_size <= 1
-            and not self.args.use_dynamic_batch
+            and self.args.ds.tensor_parallel_size <= 1
+            and not self.args.train.dynamic_batch_enable
         )
         dataloader = DataLoader(
             self.replay_buffer,
@@ -273,7 +276,7 @@ class ActorPPOTrainer(ABC):
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             packed_seq_lens=packed_seq_lens,
-            return_entropy=self.args.entropy_loss_coef is not None,
+            return_entropy=self.args.actor.entropy_coef is not None,
             **mm_inputs,
         )
 
@@ -290,12 +293,12 @@ class ActorPPOTrainer(ABC):
         if vllm_kl is not None:
             experience.info["vllm_kl"] = vllm_kl.detach()
 
-        if self.args.use_kl_loss:
-            if self.args.init_kl_coef > 0:
+        if self.args.algo.kl.use_loss:
+            if self.args.algo.kl.init_coef > 0:
                 kl = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
-                    kl_estimator=self.args.kl_estimator,
+                    kl_estimator=self.args.algo.kl.estimator,
                 )
                 logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
             else:
@@ -311,25 +314,25 @@ class ActorPPOTrainer(ABC):
         loss = actor_loss + kl_loss * kl_ctl
         # mixtral
         if self.aux_loss:
-            loss += output.aux_loss * self.args.aux_loss_coef
+            loss += output.aux_loss * self.args.actor.aux_loss_coef
         # entropy loss
-        if self.args.entropy_loss_coef is not None:
+        if self.args.actor.entropy_coef is not None:
             entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
-            if self.args.entropy_loss_coef != 0:
-                loss -= entropy_loss * self.args.entropy_loss_coef
+            if self.args.actor.entropy_coef != 0:
+                loss -= entropy_loss * self.args.actor.entropy_coef
 
-        if self.args.use_dynamic_batch:
+        if self.args.train.dynamic_batch_enable:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         self.strategy.backward(loss, self.actor, self.actor_optim)
-        if self.args.use_dynamic_batch:
+        if self.args.train.dynamic_batch_enable:
             if self.replay_buffer.dynamic_optimizer_step[step]:
                 self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
         else:
             self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
 
         if self.ema_model:
-            if self.args.use_dynamic_batch:
+            if self.args.train.dynamic_batch_enable:
                 if self.replay_buffer.dynamic_optimizer_step[step]:
                     self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
             else:
@@ -338,14 +341,14 @@ class ActorPPOTrainer(ABC):
         # Per-token losses (0-D tensors, shape carries weighting info for ppo_train)
         metrics = {"policy_loss": actor_loss.detach()}
         weights = {"policy_loss": "token"}
-        if self.args.entropy_loss_coef is not None:
+        if self.args.actor.entropy_coef is not None:
             metrics["entropy_loss"] = entropy_loss.detach()
             weights["entropy_loss"] = "token"
 
         # Non-reducible meta
         metrics["actor_lr"] = self.actor_scheduler.get_last_lr()[0]
         weights["actor_lr"] = None
-        is_optimizer_step = not self.args.use_dynamic_batch or self.replay_buffer.dynamic_optimizer_step[step]
+        is_optimizer_step = not self.args.train.dynamic_batch_enable or self.replay_buffer.dynamic_optimizer_step[step]
         if is_optimizer_step:
             metrics["actor_grad_norm"] = self.strategy.get_grad_norm(self.actor)
             weights["actor_grad_norm"] = None
@@ -376,7 +379,7 @@ class ActorPPOTrainer(ABC):
         }
 
     def broadcast_to_vllm(self):
-        use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
+        use_prefix_cache = getattr(self.strategy.args.vllm, "enable_prefix_caching", False)
         cache_reset_refs = []
         if use_prefix_cache and torch.distributed.get_rank() == 0:
             # clear prefix cache
@@ -388,10 +391,10 @@ class ActorPPOTrainer(ABC):
         count = 0
 
         def _broadcast_param(param, count, num_params):
-            use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+            use_ray = getattr(self.strategy.args.vllm, "sync_with_ray", False)
             # Fire all vllm engines for broadcast
             if torch.distributed.get_rank() == 0:
-                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                shape = param.shape if self.strategy.args.ds.zero_stage != 3 else param.ds_shape
                 refs = [
                     engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
                     for engine in self.vllm_engines
@@ -420,7 +423,7 @@ class ActorPPOTrainer(ABC):
                 for d in ipc_handle_list:
                     ipc_handles.update(d)
 
-                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                shape = param.shape if self.strategy.args.ds.zero_stage != 3 else param.ds_shape
                 refs = [
                     engine.update_weight_cuda_ipc.remote(
                         name,
@@ -436,9 +439,9 @@ class ActorPPOTrainer(ABC):
 
         def _gather_params_ctx(param):
             """Context manager that gathers sharded/TP-split parameters for weight sync."""
-            if self.strategy.args.ds_tensor_parallel_size > 1:
+            if self.strategy.args.ds.tensor_parallel_size > 1:
                 return deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True)
-            return deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3)
+            return deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.ds.zero_stage == 3)
 
         sync_fn = _handle_cuda_ipc if self.use_cuda_ipc else _broadcast_param
 
@@ -463,14 +466,14 @@ class ActorPPOTrainer(ABC):
 class PolicyModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
         args = strategy.args
-        self.save_hf_ckpt = args.save_hf_ckpt
-        self.disable_ds_ckpt = args.disable_ds_ckpt
+        self.save_hf_ckpt = args.ckpt.save_hf
+        self.disable_ds_ckpt = args.ckpt.disable_ds
         self.vllm_engines = vllm_engines
         self.max_steps = max_steps
 
         # Skip for vLLM >= 0.16 where NCCL_CUMEM_ENABLE=0 causes ncclCommInitRank to fail
         # with "unhandled cuda error" under NCCL 2.27+.
-        if getattr(args, "vllm_sync_backend", "nccl") == "nccl":
+        if getattr(args.vllm, "sync_backend", "nccl") == "nccl":
             import vllm
             from packaging import version as pkg_version
 
@@ -481,78 +484,73 @@ class PolicyModelActor(BaseModelActor):
 
         actor = Actor(
             pretrain,
-            attn_implementation=strategy.args.attn_implementation,
-            param_dtype=strategy.args.param_dtype,  # default: bf16
-            load_in_4bit=strategy.args.load_in_4bit,
-            lora_rank=strategy.args.lora_rank,
-            lora_alpha=strategy.args.lora_alpha,
-            target_modules=strategy.args.target_modules,
-            lora_dropout=strategy.args.lora_dropout,
+            attn_implementation=strategy.args.ds.attn_implementation,
+            experts_implementation=strategy.args.ds.experts_implementation,
+            param_dtype=strategy.args.ds.param_dtype,  # default: bf16
+            load_in_4bit=strategy.args.ds.load_in_4bit,
+            lora_rank=strategy.args.ds.lora.rank,
+            lora_alpha=strategy.args.ds.lora.alpha,
+            target_modules=strategy.args.ds.lora.target_modules,
+            lora_dropout=strategy.args.ds.lora.dropout,
             ds_config=strategy.get_ds_train_config(is_actor=True),
-            packing_samples=strategy.args.packing_samples,
-            temperature=strategy.args.temperature,
-            use_liger_kernel=strategy.args.use_liger_kernel,
-            freeze_visual_encoder=getattr(strategy.args, "freeze_visual_encoder", False),
+            packing_samples=strategy.args.ds.packing_samples,
+            temperature=strategy.args.rollout.temperature,
+            use_liger_kernel=strategy.args.ds.use_liger_kernel,
+            freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
         )
         strategy.print(actor)
 
         # configure tokenizer
         self.tokenizer = get_tokenizer(
-            pretrain, actor.model, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
+            pretrain, actor.model, "left", strategy, use_fast=not strategy.args.data.disable_fast_tokenizer
         )
 
-        if args.enable_ema:
+        if args.train.enable_ema:
             ema_model = Actor(
                 pretrain,
-                attn_implementation=strategy.args.attn_implementation,
-                param_dtype=strategy.args.param_dtype,  # default: bf16
-                load_in_4bit=strategy.args.load_in_4bit,
+                attn_implementation=strategy.args.ds.attn_implementation,
+                experts_implementation=strategy.args.ds.experts_implementation,
+                param_dtype=strategy.args.ds.param_dtype,  # default: bf16
+                load_in_4bit=strategy.args.ds.load_in_4bit,
                 ds_config=strategy.get_ds_eval_config(offload=True),
-                packing_samples=strategy.args.packing_samples,
+                packing_samples=strategy.args.ds.packing_samples,
             )
         else:
             ema_model = None
 
-        # configure optimizer
-        actor_optim = strategy.create_optimizer(
-            actor, lr=args.actor_learning_rate, betas=strategy.args.adam_betas, weight_decay=args.l2
-        )
-
-        actor_scheduler = get_scheduler(
-            args.lr_scheduler,
-            actor_optim,
-            num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
-            num_training_steps=max_steps,
-            scheduler_specific_kwargs={"min_lr": args.actor_learning_rate * 0.1},
-        )
-
-        if args.gradient_checkpointing:
+        if args.actor.gradient_checkpointing_enable:
             actor.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": args.gradient_checkpointing_use_reentrant}
+                gradient_checkpointing_kwargs={"use_reentrant": args.actor.gradient_checkpointing_reentrant}
             )
 
-        # prepare models/optimizers...
-        self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare(
-            (actor, actor_optim, actor_scheduler),
-            is_rlhf=True,
+        actor_cfg = dict(
+            optim=args.actor.optim,
+            muon=vars(args.actor.muon),
+            adam=vars(args.actor.adam),
+            lr_scheduler=args.actor.lr_scheduler,
+            lr_warmup_ratio=args.actor.lr_warmup_ratio,
+            min_lr_ratio=args.actor.min_lr_ratio,
+            max_norm=args.actor.max_norm,
+            scheduler_steps=max_steps,
         )
+        self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare((actor, actor_cfg))
 
         if ema_model:
             ema_model._offload = True
-            self.ema_model = strategy.prepare(ema_model, is_rlhf=True)
+            self.ema_model = strategy.prepare(ema_model)
         else:
             self.ema_model = None
 
         # load checkpoint
         self.checkpoint_states = {}
-        ckpt_path = os.path.join(args.ckpt_path, "_actor")
-        if args.load_checkpoint and os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(args.ckpt.path, "_actor")
+        if args.ckpt.load_enable and os.path.exists(ckpt_path):
             strategy.print(f"Loading the checkpoint: {ckpt_path}")
             _, states = strategy.load_ckpt(self.actor.model, ckpt_path)
             self.checkpoint_states = states
 
         # initial offload
-        if strategy.args.deepspeed_enable_sleep:
+        if strategy.args.ds.enable_sleep:
             offload_deepspeed_states(self.actor.model)
 
         # configure Trainer
@@ -562,10 +560,10 @@ class PolicyModelActor(BaseModelActor):
             ema_model=self.ema_model,
             actor_optim=self.actor_optim,
             actor_scheduler=self.actor_scheduler,
-            micro_train_batch_size=args.micro_train_batch_size,
+            micro_train_batch_size=args.train.micro_batch_size,
             tokenizer=self.tokenizer,
-            eps_clip=args.eps_clip,
-            ema_beta=args.ema_beta,
+            eps_clip=args.actor.eps_clip,
+            ema_beta=args.train.ema_beta,
             vllm_engines=self.vllm_engines,
         )
 
@@ -584,9 +582,9 @@ class PolicyModelActor(BaseModelActor):
 
         # save model checkpoint after fitting on only rank0
         self.strategy.save_model(
-            self.ema_model if args.enable_ema else self.actor,
+            self.ema_model if args.train.enable_ema else self.actor,
             self.tokenizer,
-            args.save_path,
+            args.ckpt.output_dir,
         )
 
     def forward(
@@ -638,18 +636,18 @@ class PolicyModelActor(BaseModelActor):
         if not self.disable_ds_ckpt:
             self.strategy.save_ckpt(
                 self.actor.model,
-                os.path.join(args.ckpt_path, "_actor"),
+                os.path.join(args.ckpt.path, "_actor"),
                 tag,
-                args.max_ckpt_num,
-                args.max_ckpt_mem,
+                args.ckpt.max_num,
+                args.ckpt.max_mem,
                 client_states,
                 metric_value=metric_value,
                 metric_key=metric_key,
             )
         if self.save_hf_ckpt:
-            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
+            save_path = os.path.join(args.ckpt.path, f"{tag}_hf")
             self.strategy.save_model(
-                self.ema_model if args.enable_ema else self.actor,
+                self.ema_model if args.train.enable_ema else self.actor,
                 self.tokenizer,
                 save_path,
             )

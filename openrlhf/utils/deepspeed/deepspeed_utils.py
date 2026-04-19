@@ -16,6 +16,7 @@ def get_train_ds_config(
     use_ds_universal_ckpt=False,
     deepcompile=False,
     tensor_parallel_size=1,
+    optim_config=None,
 ):
     device = "cpu" if offload else "none"
     zero_opt_dict = {
@@ -42,7 +43,7 @@ def get_train_ds_config(
     if stage == 3:
         zero_opt_dict["reduce_scatter"] = True
 
-    return {
+    ds_config = {
         "steps_per_print": 100,
         "zero_optimization": zero_opt_dict,
         "bf16": {
@@ -65,6 +66,13 @@ def get_train_ds_config(
             "autotp_size": tensor_parallel_size,
         },
     }
+
+    # Optimizer — always config-based, DeepSpeed creates it from this config.
+    # DS auto-selects FusedAdam / DeepSpeedCPUAdam based on offload setting.
+    if optim_config is not None:
+        ds_config["optimizer"] = optim_config
+
+    return ds_config
 
 
 def get_eval_ds_config(

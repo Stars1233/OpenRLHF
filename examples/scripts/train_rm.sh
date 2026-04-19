@@ -2,29 +2,29 @@ set -x
 
 read -r -d '' training_commands <<EOF
 openrlhf.cli.train_rm \
-   --save_path ./checkpoint/llama3-8b-rm \
-   --save_steps -1 \
-   --logging_steps 1 \
-   --eval_steps -1 \
-   --train_batch_size 256 \
-   --micro_train_batch_size 1 \
-   --pretrain OpenRLHF/Llama-3-8b-sft-mixture \
-   --param_dtype bf16 \
-   --max_epochs 1 \
-   --max_len 8192 \
-   --zero_stage 3 \
-   --learning_rate 9e-6 \
-   --dataset OpenRLHF/preference_dataset_mixture2_and_safe_pku \
-   --apply_chat_template \
-   --chosen_key chosen \
-   --rejected_key rejected \
-   --attn_implementation flash_attention_2 \
-   --load_checkpoint \
-   --packing_samples \
-   --gradient_checkpointing
+   --ckpt.output_dir ./checkpoint/llama3-8b-rm \
+   --ckpt.save_steps -1 \
+   --logger.logging_steps 1 \
+   --eval.steps -1 \
+   --train.batch_size 256 \
+   --train.micro_batch_size 1 \
+   --model.model_name_or_path OpenRLHF/Llama-3-8b-sft-mixture \
+   --ds.param_dtype bf16 \
+   --train.max_epochs 1 \
+   --data.max_len 8192 \
+   --ds.zero_stage 3 \
+   --adam.lr 9e-6 \
+   --data.dataset OpenRLHF/preference_dataset_mixture2_and_safe_pku \
+   --data.apply_chat_template \
+   --data.chosen_key chosen \
+   --data.rejected_key rejected \
+   --ds.attn_implementation flash_attention_2 \
+   --ckpt.load_enable \
+   --ds.packing_samples \
+   --model.gradient_checkpointing_enable
 EOF
-     # --use_wandb [WANDB_TOKENS] or True (use wandb login command)
-     # --packing_samples
+     # --logger.wandb.key [WANDB_TOKENS] or True (use wandb login command)
+     # --ds.packing_samples
 
 
 if [[ ${1} != "slurm" ]]; then
