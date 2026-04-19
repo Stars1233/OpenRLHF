@@ -14,7 +14,7 @@ openrlhf.cli.train_dpo \
    --data.max_len 8192 \
    --ds.zero_stage 3 \
    --adam.lr 5e-7 \
-   --beta 0.1 \
+   --model.beta 0.1 \
    --data.dataset OpenRLHF/preference_dataset_mixture2_and_safe_pku \
    --data.apply_chat_template \
    --data.chosen_key chosen \
