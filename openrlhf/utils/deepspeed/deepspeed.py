@@ -320,6 +320,23 @@ class DeepspeedStrategy(ABC):
                     f"nesterov=True inside muon_update() and ignores config overrides.",
                     stacklevel=2,
                 )
+            # DS applies clipping AFTER muon_update replaces the raw grad with
+            # the Newton-Schulz output, so the reported `grad_norm` is the NS
+            # output's Frobenius norm (~sqrt(sum min(m,n)) ≈ 700 for a 1.5B
+            # model). An Adam-scale max_norm (e.g. 1.0) will then scale the NS
+            # update down ~700x and effectively kill Muon. Warn loudly — users
+            # should pass `max_norm=0` (disable) until DS fixes the ordering.
+            if cfg.get("max_norm", 0) > 0:
+                import warnings as _warnings
+
+                _warnings.warn(
+                    f"Muon + gradient_clipping={cfg['max_norm']}: DeepSpeed applies "
+                    f"the clip AFTER Newton-Schulz, so any positive max_norm is "
+                    f"measured against the post-NS scale (~sqrt(sum min(m,n))). "
+                    f"For Muon runs, set `max_norm=0` to disable global clipping "
+                    f"(NS already bounds per-matrix spectral norm to 1).",
+                    stacklevel=2,
+                )
             optim_dict = {
                 "type": "Muon",
                 "params": {
