@@ -52,7 +52,7 @@ class CriticPPOTrainer(ABC):
             micro_train_batch_size,
             buffer_limit,
             buffer_cpu_offload,
-            getattr(self.args.data, "packing_samples", False),
+            self.args.ds.packing_samples,
             self.args.train.dynamic_batch_enable,
         )
 

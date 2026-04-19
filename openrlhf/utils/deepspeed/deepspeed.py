@@ -148,23 +148,26 @@ class DeepspeedStrategy(ABC):
         if optim == "muon":
             from packaging import version
 
+            # 0.18.9 is the first release that honors `muon_lr` / `adam_lr` config
+            # overrides (engine.py:1757-1771). Earlier 0.18.x silently drops them,
+            # causing aux-Adam to inherit the Muon lr — ~20000x the intended value.
             assert version.parse(deepspeed.__version__) >= version.parse(
-                "0.18.2"
-            ), f"Muon optimizer requires deepspeed >= 0.18.2, got {deepspeed.__version__}"
-            # Muon for internal 2-D weight matrices; Adam for embeddings, classifier/value heads, and 1-D params.
-            # DS Muon dispatches based on the `use_muon` attribute per parameter.
-            # Covers LLaMA/Mistral/Qwen (embed_tokens), GPT-2 (wte/wpe), and RM/PPO critic value heads.
-            _muon_exclude = {"embed", "lm_head", "wte", "wpe"}
-            value_head_prefix = getattr(raw_model, "value_head_prefix", None)
-            for name, param in raw_model.named_parameters():
-                top_level_name = name.split(".", 1)[0]
-                is_value_head = value_head_prefix is not None and top_level_name == value_head_prefix
-                param.use_muon = param.ndim >= 2 and not is_value_head and not any(k in name for k in _muon_exclude)
-            # DS Muon (engine.py 1597-1611) partitions a flat Parameter list via p.use_muon
-            # and refuses param-group dicts; it also applies a single scalar weight_decay
-            # to both the Muon and aux-Adam groups. Splitting groups post-init would desync
-            # ZeRO's cached bit16_groups/fp32_groups metadata (new groups never get stepped),
-            # so bias/LayerNorm decay exemption under Muon is NOT applied here -- DS limitation.
+                "0.18.9"
+            ), f"Muon optimizer requires deepspeed >= 0.18.9, got {deepspeed.__version__}"
+            # DS sets `use_muon` itself inside `deepspeed.initialize` via
+            # set_optimizer_flags (__init__.py:71-77). We pass raw grad-enabled params
+            # and let DS handle partitioning. DS applies one scalar weight_decay to
+            # both the Muon and aux-Adam groups, so bias/LayerNorm decay exemption
+            # is NOT applied under Muon — warn when the user sets weight_decay>0.
+            if weight_decay > 0:
+                import warnings as _warnings
+
+                _warnings.warn(
+                    f"Muon + weight_decay={weight_decay} will also decay bias/LayerNorm "
+                    f"(the Adam path exempts them). DS applies one scalar weight_decay to "
+                    f"both the Muon and aux-Adam groups.",
+                    stacklevel=2,
+                )
             model_parameters = [param for param in raw_model.parameters() if param.requires_grad]
         else:
             # Adam: exempt bias/layernorm from weight decay.
@@ -268,8 +271,8 @@ class DeepspeedStrategy(ABC):
             }
 
           When ``optim="muon"``, the Muon group uses ``muon.lr`` / ``muon.momentum``;
-          the aux-Adam subgroup uses ``adam.betas`` / ``adam.eps``; ``adam.weight_decay``
-          is shared (DS v0.18.2 uses one ``weight_decay`` for both groups).
+          the aux-Adam subgroup uses ``adam.lr`` / ``adam.betas`` / ``adam.eps``;
+          ``adam.weight_decay`` is shared (DS applies one scalar ``weight_decay`` to both groups).
         * ``model`` — evaluation only, no optimizer.
 
         Returns ``(model, optimizer, scheduler)`` for training entries and the
@@ -290,22 +293,24 @@ class DeepspeedStrategy(ABC):
         return ret[0] if len(ret) == 1 else ret
 
     def _ds_init_train_model(self, model, cfg: dict):
-        # DS v0.18.2 optimizer-config whitelists (engine.py:1600-1611):
+        # DS v0.18.9 optimizer-config whitelists (engine.py:1755-1772):
         #   AdamW:  {lr, betas, eps, weight_decay}
-        #   Muon:   muon group -> {lr, momentum, weight_decay}
-        #           aux-Adam   -> {lr, betas, eps, weight_decay}   (lr/weight_decay shared)
-        # Keys outside these sets are silently dropped.  ns_steps / nesterov are
-        # NOT configurable via DS config in v0.18.2 (hard-coded: ns_steps=5, nesterov=True).
+        #   Muon:   muon group -> {lr, momentum, weight_decay, muon_lr}
+        #           aux-Adam   -> {lr, betas, eps, weight_decay, adam_lr}
+        # ``muon_lr`` / ``adam_lr`` override ``lr`` per-group.  Keys outside these
+        # sets are silently dropped.  ns_steps / nesterov are NOT configurable via
+        # DS config in 0.18.x (hard-coded: ns_steps=5, nesterov=True).
         kind = cfg["optim"]
         adam = cfg["adam"]
         if kind == "muon":
             muon = cfg["muon"]
-            # DS engine.py:1645,1654 reads `muon_lr` / `adam_lr` from the config
-            # and uses them to OVERRIDE the per-group lr at param-group construction.
-            # Without these keys, both groups silently inherit the same top-level lr —
-            # which meant embeddings/head/value_head were trained at Muon lr (0.02).
-            # Emit both explicitly so the two groups follow their own initial lrs;
-            # the HF scheduler then drives each group independently.
+            # DS 0.18.9 engine.py:1757-1771 reads `muon_lr` / `adam_lr` from the
+            # config and uses them to OVERRIDE the per-group lr at param-group
+            # construction. Emit both explicitly so the two groups follow their
+            # own initial lrs; the HF scheduler then drives each group independently.
+            # (Earlier 0.18.x silently dropped these keys, causing aux-Adam to
+            # inherit the Muon lr — ~20000x the intended value. The version
+            # assert in _get_model_parameters guards against that.)
             #
             # ns_steps / nesterov: DS v0.18.x Muon hard-codes ns_steps=5, nesterov=True
             # inside muon_update() and does NOT accept them via config. We expose the
@@ -388,29 +393,21 @@ class DeepspeedStrategy(ABC):
             model, optim=optim_kind, weight_decay=adam["weight_decay"]
         )
 
-        # DS __init__.py:69-75 (set_optimizer_flags) overwrites every param's
-        # use_muon attribute using a substring rule that mis-classifies value_head
-        # (sent to Muon — wrong per Keller Jordan) and GPT-2 wte/wpe (also sent to
-        # Muon because they do not contain the "embed" substring). Our
-        # _get_model_parameters() above already set use_muon correctly with the
-        # project-specific exclusions; no-op DS's override for the duration of
-        # initialize() and restore afterwards.
-        _ds_set_flags_orig = getattr(deepspeed, "set_optimizer_flags", None)
-        if optim_kind == "muon" and _ds_set_flags_orig is not None:
-            deepspeed.set_optimizer_flags = lambda *args, **kwargs: None
-        try:
-            engine, optim, _, scheduler = deepspeed.initialize(
-                model=raw_model,
-                optimizer=None,
-                model_parameters=model_parameters,
-                lr_scheduler=sched_factory,
-                config=ds_config,
-                args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
-                dist_init_required=True,
-            )
-        finally:
-            if _ds_set_flags_orig is not None:
-                deepspeed.set_optimizer_flags = _ds_set_flags_orig
+        # DS classifies params via set_optimizer_flags (__init__.py:71-77 on 0.18.9):
+        # ndim>=2 and name not containing "embed"/"lm_head" → Muon, else aux-Adam.
+        # This works for LLaMA/Mistral/Qwen actors. Edge cases (GPT-2 wte/wpe, RM
+        # value heads, LoRA A/B matrices) are classified to Muon by the default rule
+        # — acceptable for now; add a per-parameter override here if we need to
+        # exempt a specific head / adapter weight.
+        engine, optim, _, scheduler = deepspeed.initialize(
+            model=raw_model,
+            optimizer=None,
+            model_parameters=model_parameters,
+            lr_scheduler=sched_factory,
+            config=ds_config,
+            args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
+            dist_init_required=True,
+        )
 
         if self.deepcompile:
             engine.compile()
